@@ -1,5 +1,5 @@
 // server.cpp
-// Complete FTP + Chat Server Implementation
+// Complete FTP + Chat Server Implementation using select()
 // Computer Networks Assignment
 
 #include <iostream>
@@ -20,8 +20,6 @@
 #include <ctime>
 #include <dirent.h>
 #include <signal.h>
-#include <sys/wait.h>
-#include <pthread.h>
 
 #define BUFFER_SIZE 8192
 #define FILE_BUFFER_SIZE 65536
@@ -37,17 +35,22 @@ struct Client {
     string username;
     bool is_authenticated;
     time_t connect_time;
+    char buffer[BUFFER_SIZE];  // Partial data buffer
+    size_t buffer_len;          // Current length in buffer
     
-    Client() : socket_fd(-1), username(""), is_authenticated(false), connect_time(0) {}
+    Client() : socket_fd(-1), username(""), is_authenticated(false), connect_time(0), buffer_len(0) {
+        memset(buffer, 0, BUFFER_SIZE);
+    }
     
     Client(int fd, const string& name) : socket_fd(fd), username(name), 
-                                          is_authenticated(true), connect_time(time(0)) {}
+                                          is_authenticated(true), connect_time(time(0)), buffer_len(0) {
+        memset(buffer, 0, BUFFER_SIZE);
+    }
 };
 
 // Global variables
 vector<Client> clients;
 map<string, size_t> file_sizes; // Cache file sizes
-pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // Function to split string by delimiter
 vector<string> split_string(const string& str, char delimiter) {
@@ -111,38 +114,37 @@ Client* find_client_by_socket(int socket_fd) {
 
 // Remove client from list
 void remove_client(int socket_fd) {
-    pthread_mutex_lock(&clients_mutex);
-    
     auto it = find_if(clients.begin(), clients.end(), 
                       [socket_fd](const Client& c) { return c.socket_fd == socket_fd; });
     
     if (it != clients.end()) {
         string username = it->username;
+        
+        // Close the socket
+        close(it->socket_fd);
+        
+        // Remove from vector
         clients.erase(it);
         
         // Broadcast user left message
         string leave_msg = "SYSTEM|" + username + " has left the chat";
         for (auto& client : clients) {
-            send(client.socket_fd, leave_msg.c_str(), leave_msg.length(), 0);
+            if (client.is_authenticated) {
+                send(client.socket_fd, leave_msg.c_str(), leave_msg.length(), 0);
+            }
         }
         
         log_activity("User '" + username + "' disconnected. Total clients: " + to_string(clients.size()));
     }
-    
-    pthread_mutex_unlock(&clients_mutex);
 }
 
 // Send message to all clients except one
 void broadcast_message(const string& message, int exclude_fd = -1) {
-    pthread_mutex_lock(&clients_mutex);
-    
     for (auto& client : clients) {
         if (client.socket_fd != exclude_fd && client.is_authenticated) {
             send(client.socket_fd, message.c_str(), message.length(), 0);
         }
     }
-    
-    pthread_mutex_unlock(&clients_mutex);
 }
 
 // Send private message
@@ -184,7 +186,7 @@ string get_file_list() {
             string full_path = string(SERVER_FILE_DIR) + "/" + filename;
             if (stat(full_path.c_str(), &st) == 0) {
                 size_t size_kb = st.st_size / 1024;
-                if (size_kb == 0 && st.st_size > 0) size_kb = 1; // At least 1 KB for small files
+                if (size_kb == 0 && st.st_size > 0) size_kb = 1;
                 file_list += "|" + filename + ":" + to_string(size_kb);
             }
         }
@@ -374,16 +376,14 @@ bool handle_pm_command(Client* sender, const string& target, const string& messa
 bool handle_users_command(int client_socket) {
     string user_list = "USER_LIST";
     
-    pthread_mutex_lock(&clients_mutex);
     for (auto& client : clients) {
         if (client.is_authenticated) {
             user_list += "|" + client.username;
         }
     }
-    pthread_mutex_unlock(&clients_mutex);
     
     send(client_socket, user_list.c_str(), user_list.length(), 0);
-    log_activity("Sent user list to client");
+    log_activity("Sent user list to client. Total users: " + to_string(clients.size()));
     return true;
 }
 
@@ -425,13 +425,22 @@ void process_command(int client_socket, const string& command) {
     }
     else if (parts[0] == "QUIT") {
         log_activity("User '" + client->username + "' requested quit");
-        close(client_socket);
         remove_client(client_socket);
     }
 }
 
-// Handle client connection (forked process)
-void handle_client(int client_socket, struct sockaddr_in client_addr) {
+// Handle new client connection
+void handle_new_connection(int server_socket) {
+    struct sockaddr_in client_addr;
+    socklen_t client_len = sizeof(client_addr);
+    
+    int client_socket = accept(server_socket, (struct sockaddr*)&client_addr, &client_len);
+    
+    if (client_socket < 0) {
+        log_error("Failed to accept connection");
+        return;
+    }
+    
     char client_ip[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
     int client_port = ntohs(client_addr.sin_port);
@@ -446,7 +455,7 @@ void handle_client(int client_socket, struct sockaddr_in client_addr) {
     if (bytes_received <= 0) {
         log_error("Failed to receive username from client");
         close(client_socket);
-        exit(0);
+        return;
     }
     
     string reg_msg(buffer);
@@ -455,26 +464,23 @@ void handle_client(int client_socket, struct sockaddr_in client_addr) {
     if (parts.size() < 2 || parts[0] != "REGISTER") {
         log_error("Invalid registration message from client");
         close(client_socket);
-        exit(0);
+        return;
     }
     
     string username = parts[1];
     
     // Check if username already taken
-    pthread_mutex_lock(&clients_mutex);
     bool username_taken = (find_client_by_username(username) != nullptr);
     
     if (username_taken) {
         send(client_socket, "USERNAME_TAKEN", 14, 0);
-        pthread_mutex_unlock(&clients_mutex);
         log_activity("Username taken: " + username);
         close(client_socket);
-        exit(0);
+        return;
     }
     
     // Add client to list
     clients.push_back(Client(client_socket, username));
-    pthread_mutex_unlock(&clients_mutex);
     
     // Send success message
     string welcome_msg = "SYSTEM|Welcome to the chat, " + username + "!";
@@ -485,37 +491,32 @@ void handle_client(int client_socket, struct sockaddr_in client_addr) {
     broadcast_message(join_msg, client_socket);
     
     log_activity("User '" + username + "' registered. Total clients: " + to_string(clients.size()));
-    
-    // Main client communication loop
-    while (true) {
-        memset(buffer, 0, BUFFER_SIZE);
-        bytes_received = recv(client_socket, buffer, BUFFER_SIZE - 1, 0);
-        
-        if (bytes_received <= 0) {
-            // Client disconnected
-            log_activity("Client '" + username + "' disconnected");
-            break;
-        }
-        
-        string command(buffer);
-        process_command(client_socket, command);
-    }
-    
-    // Cleanup
-    close(client_socket);
-    remove_client(client_socket);
-    exit(0);
 }
 
-// Signal handler for zombie processes
-void sigchld_handler(int sig) {
-    while (waitpid(-1, NULL, WNOHANG) > 0);
+// Handle data from existing client
+void handle_client_data(int client_socket) {
+    char buffer[BUFFER_SIZE];
+    memset(buffer, 0, BUFFER_SIZE);
+    
+    ssize_t bytes_received = recv(client_socket, buffer, BUFFER_SIZE - 1, 0);
+    
+    if (bytes_received <= 0) {
+        // Client disconnected
+        Client* client = find_client_by_socket(client_socket);
+        if (client) {
+            log_activity("Client '" + client->username + "' disconnected");
+        }
+        remove_client(client_socket);
+        return;
+    }
+    
+    string command(buffer);
+    process_command(client_socket, command);
 }
 
 int main(int argc, char* argv[]) {
-    int server_socket, client_socket;
-    struct sockaddr_in server_addr, client_addr;
-    socklen_t client_len = sizeof(client_addr);
+    int server_socket;
+    struct sockaddr_in server_addr;
     int port = PORT;
     
     // Get port from command line if provided
@@ -525,9 +526,6 @@ int main(int argc, char* argv[]) {
     
     // Create server file directory
     create_server_file_dir();
-    
-    // Set up signal handler for zombie processes
-    signal(SIGCHLD, sigchld_handler);
     
     // Create socket
     server_socket = socket(AF_INET, SOCK_STREAM, 0);
@@ -568,39 +566,53 @@ int main(int argc, char* argv[]) {
     cout << "\033[32m=========================================\033[0m" << endl;
     cout << "\033[33mServer listening on port " << port << "\033[0m" << endl;
     cout << "\033[33mFile directory: " << SERVER_FILE_DIR << "\033[0m" << endl;
+    cout << "\033[33mUsing select() for multi-client handling\033[0m" << endl;
     cout << "\033[33mWaiting for connections...\033[0m" << endl;
     cout << "=========================================" << endl << endl;
     
-    // Main server loop
+    // Main server loop using select()
+    fd_set read_fds;
+    int max_fd;
+    
     while (true) {
-        // Accept client connection
-        client_socket = accept(server_socket, (struct sockaddr*)&client_addr, &client_len);
+        // Clear the set
+        FD_ZERO(&read_fds);
         
-        if (client_socket < 0) {
-            log_error("Failed to accept connection");
+        // Add server socket to set
+        FD_SET(server_socket, &read_fds);
+        max_fd = server_socket;
+        
+        // Add client sockets to set
+        for (auto& client : clients) {
+            if (client.is_authenticated && client.socket_fd > 0) {
+                FD_SET(client.socket_fd, &read_fds);
+                if (client.socket_fd > max_fd) {
+                    max_fd = client.socket_fd;
+                }
+            }
+        }
+        
+        // Wait for activity on any socket
+        if (select(max_fd + 1, &read_fds, NULL, NULL, NULL) < 0) {
+            log_error("Select error");
             continue;
         }
         
-        // Fork to handle client
-        pid_t pid = fork();
+        // Check for new connection
+        if (FD_ISSET(server_socket, &read_fds)) {
+            handle_new_connection(server_socket);
+        }
         
-        if (pid < 0) {
-            log_error("Failed to fork process");
-            close(client_socket);
-        }
-        else if (pid == 0) {
-            // Child process - handle client
-            close(server_socket);
-            handle_client(client_socket, client_addr);
-            exit(0);
-        }
-        else {
-            // Parent process - continue listening
-            close(client_socket);
+        // Check for data from existing clients
+        for (auto& client : clients) {
+            if (client.is_authenticated && FD_ISSET(client.socket_fd, &read_fds)) {
+                handle_client_data(client.socket_fd);
+                break; // Break because clients vector might have been modified
+            }
         }
     }
     
-    // Cleanup (never reached in this implementation)
+    // Cleanup
     close(server_socket);
     return 0;
 }
