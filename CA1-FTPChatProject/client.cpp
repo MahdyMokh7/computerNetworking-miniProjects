@@ -15,10 +15,13 @@
 #include <sys/select.h>
 #include <ctime>
 #include <iomanip>
+#include <sys/stat.h> 
+#include <sys/types.h>
 
 #define BUFFER_SIZE 8192
 #define FILE_BUFFER_SIZE 65536
 #define PORT 8888
+#define CLIENT_FILE_DIR "test_files"
 
 using namespace std;
 
@@ -102,10 +105,13 @@ void display_progress(size_t current, size_t total, const string& filename) {
 
 // Function to handle file upload
 bool upload_file(int sock, const string& filename) {
-    ifstream file(filename, ios::binary | ios::ate);
+    // Build full path using test_files folder
+    string full_path = string(CLIENT_FILE_DIR) + "/" + filename;
+    
+    ifstream file(full_path, ios::binary | ios::ate);
     
     if (!file.is_open()) {
-        display_message("ERROR", "", "Cannot open file: " + filename);
+        display_message("ERROR", "", "Cannot open file: " + full_path);
         return false;
     }
     
@@ -150,7 +156,7 @@ bool upload_file(int sock, const string& filename) {
     display_message("FILE", "", "Uploading " + filename + " (" + 
                    to_string(file_size / 1024) + " KB)...");
     
-    while (total_sent < file_size) {
+    while (total_sent < (size_t)file_size) {
         size_t remaining = file_size - total_sent;
         size_t to_send = min(remaining, (size_t)FILE_BUFFER_SIZE);
         
@@ -196,6 +202,7 @@ bool upload_file(int sock, const string& filename) {
         return false;
     }
 }
+// Function to handle file download
 
 // Function to handle file download
 bool download_file(int sock, const string& filename) {
@@ -235,10 +242,20 @@ bool download_file(int sock, const string& filename) {
     string file_name = parts[1];
     size_t file_size = stoull(parts[2]);
     
+    // Create test_files directory if it doesn't exist
+    struct stat st;
+    if (stat(CLIENT_FILE_DIR, &st) == -1) {
+        mkdir(CLIENT_FILE_DIR, 0777);
+        display_message("FILE", "", "Created directory: " + string(CLIENT_FILE_DIR));
+    }
+    
+    // Build full path using test_files folder
+    string full_path = string(CLIENT_FILE_DIR) + "/" + file_name;
+    
     // Open file for writing
-    ofstream outfile(file_name, ios::binary);
+    ofstream outfile(full_path, ios::binary);
     if (!outfile.is_open()) {
-        display_message("ERROR", "", "Cannot create file: " + file_name);
+        display_message("ERROR", "", "Cannot create file: " + full_path);
         return false;
     }
     
@@ -250,7 +267,7 @@ bool download_file(int sock, const string& filename) {
     size_t total_received = 0;
     size_t remaining = file_size;
     
-    display_message("FILE", "", "Downloading " + file_name + " (" + 
+    display_message("FILE", "", "Downloading " + filename + " (" + 
                    to_string(file_size / 1024) + " KB)...");
     
     while (total_received < file_size) {
@@ -276,7 +293,7 @@ bool download_file(int sock, const string& filename) {
     delete[] file_buffer;
     outfile.close();
     
-    display_message("FILE", "", "Download completed successfully!");
+    display_message("FILE", "", "Download completed successfully! Saved to: " + full_path);
     return true;
 }
 
